@@ -1,0 +1,241 @@
+#!/usr/bin/python
+import email
+import sys
+import os
+import smtplib
+import base64
+import random
+import uuid
+import json
+from subprocess import Popen, PIPE
+import re
+import random
+import string
+
+try:
+    import simplejson as json
+except ImportError:
+    import json
+try:
+    import httplib
+except ImportError:
+    import http.client as httplib
+    
+def id_generator(size=6, chars=string.ascii_uppercase + string.digits):
+    return ''.join(random.choice(chars) for _ in range(size))
+
+def globalconfig(item):
+    configdict = {
+                  'vm_transcription' : True, # Transcribe voicemail to text (requires Microsoft Azure Cognitive services subscription)
+                  'transcription_string' : '{{{{TRANSCRIPTION}}}}', # String to search for in the email which will be replaced by the transcribed text
+                  'gcloud_service_json' : '/path/to/your/service.json', # Gcloud JSON file location
+                  'speech_language' : 'en-US', # Language for speech recognition
+                  'vm_to_mp3' : False, # Convert voicemail audio to MP3
+                  'temp_dir': '/tmp/conv', # Temp location for MP3 conversion. MUST BE WRITABLE!
+                  'ffmpeg_location' : '/usr/bin/ffmpeg', # If vm_to_mp3 is True, location of ffmpeg executable
+                  'sox_location' : '/usr/bin/sox', # If vm_to_mp3 is True, location of ffmpeg executable
+                  'check_html' : True, # Check to see if message is HTML and set mimetype accordingly
+                  'check_descr_fortag' : True, # Check to see if user description contains string "transcribevms=yes"
+                  'db': 'asterisk', # your DB username
+                  'db_user': 'YOURUSER', # your DB username
+                  'db_pass': 'YOURPASS', # your DB username
+                  'db_host': 'localhost', # your DB username
+                 }
+    return configdict[item]
+
+def speechrec(wavobj):
+    """
+    Convert wav to flac and send to Google Cloud Speech
+    """
+    from google.oauth2 import service_account
+    from google.cloud import speech
+    from google.cloud.speech import enums
+    from google.cloud.speech import types
+    import io
+    import sys
+    import subprocess
+    
+    # Decode base64 attachment
+    outobj = base64.b64decode(wavobj)
+    
+    #write to temp file
+    randid = id_generator()
+    audiofilename = globalconfig('temp_dir') + '/' + randid + ".wav"
+    flacaudiofile = globalconfig('temp_dir') + '/' + randid + ".flac"
+    
+    try:
+        tempwav = open(audiofilename, "w")
+        tempwav.write(outobj)
+        tempwav.close()
+    except (Exception) as e:
+        sys.exit("Error writing to : " + audiofilename)
+        # return ""
+        
+    # convert to flac
+    retcode = subprocess.call(["sox",audiofilename,"--channels=1","--bits=16","--rate=41000",flacaudiofile])
+
+    creds = service_account.Credentials.from_service_account_file(globalconfig('gcloud_service_json'))
+    client = speech.SpeechClient(credentials=creds)
+
+    with io.open(flacaudiofile, 'rb') as audio_file:
+        content = audio_file.read()
+        
+    audio = types.RecognitionAudio(content=content)
+    config = types.RecognitionConfig(
+        encoding=enums.RecognitionConfig.AudioEncoding.FLAC,
+        sample_rate_hertz=41000,
+        language_code='en-US')
+        
+    response  = client.recognize(config, audio)
+
+    outstr = ""
+    for result in response.results:
+        for alternative in result.alternatives:
+            outstr += "Confidence (this is still beta): " + str("{:.2%}".format(alternative.confidence)) + "\n"
+            outstr += alternative.transcript
+    
+    # cleanup files
+    os.remove(audiofilename)
+    os.remove(flacaudiofile)
+    
+    return outstr
+    
+def examinehtml(textobject, contenttype):
+    """
+    Checks to see if HTML tags exist in the message and changes content type
+    """
+    if not globalconfig('check_html'):
+        return contenttype
+    if (('<html>' in textobject) and ('</html>' in textobject)):
+        return 'text/html'
+    else:
+        return 'text/plain'
+
+def vmtomp3(filename, wavobj):
+    """
+    Converts wav attachments to MP3. Requires FFMPEG
+    """
+    outobj = base64.b64decode(wavobj)
+    if not globalconfig('vm_to_mp3'):
+        return [filename, 'audio/x-wav', outobj]
+    randfilename = str(random.randint(1,10000000000)) + filename
+    newrandfilename = randfilename[:-3] + "mp3"
+    try:
+        tempwav = open(globalconfig('temp_dir') + '/' + randfilename, "w")
+        tempwav.write(outobj)
+        tempwav.close()
+    except (Exception) as e:
+        return [filename, 'audio/x-wav', outobj]
+    ffcommand = [globalconfig('ffmpeg_location'), '-loglevel', 'error', '-i', globalconfig('temp_dir') + '/' + randfilename, '-ab', '16k', globalconfig('temp_dir') + '/' + newrandfilename]
+    child = Popen(ffcommand, stdout=PIPE, stderr=PIPE)
+    stdout, stderr = child.communicate()
+    rc = child.returncode
+    if rc == 0:
+        mp3handle = open(globalconfig('temp_dir') + '/' + newrandfilename, 'r')
+        mp3dump = mp3handle.read()
+        try:
+            os.remove(globalconfig('temp_dir') + '/' + randfilename)
+        except:
+            pass
+        try:
+            os.remove(globalconfig('temp_dir') + '/' + newrandfilename)
+        except:
+            pass
+        return [filename[:-3] + 'mp3', 'audio/x-mpeg-3', mp3dump]
+    else:
+        return [filename, 'audio/x-wav', outobj]
+
+# writing to text file
+# with open("/tmp/conv/log.txt", "a") as myfile:
+    # myfile.write("before")
+    
+# Get entire email from STDIN
+parser = email.message_from_file(sys.stdin)
+# If it's a multipart message we need to look for audio attachments
+if parser.is_multipart():
+    for payload in parser.walk():
+        if payload.get_content_type() == 'text/plain':
+            textobj = payload.get_payload()
+            newcontenttype = examinehtml(textobj, payload.get_content_type())
+            for key,value in payload.items():
+                if key == 'Content-Type':
+                    newheader = value.replace('text/plain', newcontenttype)
+                    payload.replace_header(key,newheader)
+        if payload.get_content_type() == 'audio/x-wav':
+            waveobj = payload.get_payload()
+            filename = payload.get_filename()
+            # MP3 Conversion
+            mp3conv = vmtomp3(filename, waveobj)
+            # Transcription
+            if globalconfig('vm_transcription'):
+                run_transcription = True
+                speech = ""
+                
+                if globalconfig('check_descr_fortag'):
+                    # find ext from body
+                    matchObj = re.search( r'.*There is a new voicemail in mailbox (\d+):.*', textobj, re.M|re.I)
+                    
+                    if matchObj:
+                        foundExt = matchObj.group(1)
+
+                        import MySQLdb
+
+                        # Open database connection
+                        db = MySQLdb.connect(globalconfig('db_host'),globalconfig('db_user'),globalconfig('db_pass'),globalconfig('db'))
+
+                        # prepare a cursor object using cursor() method
+                        cursor = db.cursor()
+
+                        # execute SQL query using execute() method.
+                        query = "SELECT description from userman_users where username='" + foundExt + "' AND description LIKE '%transcribevms=yes%' LIMIT 1"
+                        cursor.execute(query)
+
+                        # Fetch a single row using fetchone() method.
+                        foundrows = cursor.rowcount
+
+                        # disconnect from server
+                        db.close()
+                        
+                        if foundrows == 0:
+                            run_transcription = False
+                
+                if run_transcription:
+                    speech += "Transcription\n"
+                    speech += speechrec(waveobj)
+            # Iterate through headers and modify accordinglyl
+            for key,value in payload.items():
+                if key == 'Content-Type':
+                    newheader = value.replace('audio/x-wav', mp3conv[1])
+                    newheader = newheader.replace(filename, mp3conv[0])
+                    payload.replace_header(key,newheader)
+                if key == 'Content-Disposition':
+                    newheader = value.replace(filename, mp3conv[0])
+                    payload.replace_header(key,newheader)
+            payload.set_payload(email.base64MIME.encode(mp3conv[2]))
+    if globalconfig('vm_transcription'):
+        outstr = str(parser).replace(globalconfig('transcription_string'), speech)
+    else:
+        outstr = str(parser).replace(globalconfig('transcription_string'), "")
+    # First line has garbage we don't need...
+    indx1 = outstr.find('\n')
+    # Output finished email to stdout
+    sys.stdout.write(outstr[indx1+1:])
+else:
+    outstr = str(parser)
+    if parser.get_content_type() == 'text/plain':
+        textobj = parser.get_payload()
+        newcontenttype = examinehtml(textobj, parser.get_content_type())
+        for key,value in parser.items():
+            if key == 'Content-Type':
+                newheader = value.replace('text/plain', newcontenttype)
+                parser.replace_header(key,newheader)
+    outstr = outstr.replace('text/plain', newcontenttype)
+    outstr = outstr.replace(globalconfig('transcription_string'), "No transcription.")
+    # First line has garbage we don't need...
+    indx1 = outstr.find('\n')
+    # Output finished email to stdout
+    sys.stdout.write(outstr[indx1+1:])
+    
+# myfile.write("end")
+
+sys.exit()
