@@ -11,6 +11,7 @@ from subprocess import Popen, PIPE
 import re
 import random
 import string
+from datetime import datetime
 
 try:
     import simplejson as json
@@ -28,7 +29,7 @@ def globalconfig(item):
     configdict = {
                   'vm_transcription' : True, # Transcribe voicemail to text (requires Microsoft Azure Cognitive services subscription)
                   'transcription_string' : '{{{{TRANSCRIPTION}}}}', # String to search for in the email which will be replaced by the transcribed text
-                  'gcloud_service_json' : '/path/to/your/service.json', # Gcloud JSON file location
+                  'gcloud_service_json' : '/usr/local/bin/vm-speech-to-text-4e349e5f53fe.json', # Gcloud JSON file location
                   'speech_language' : 'en-US', # Language for speech recognition
                   'vm_to_mp3' : False, # Convert voicemail audio to MP3
                   'temp_dir': '/tmp/conv', # Temp location for MP3 conversion. MUST BE WRITABLE!
@@ -71,8 +72,9 @@ def speechrec(wavobj):
         sys.exit("Error writing to : " + audiofilename)
         # return ""
         
+        
     # convert to flac
-    retcode = subprocess.call(["sox",audiofilename,"--channels=1","--bits=16","--rate=41000",flacaudiofile])
+    retcode = subprocess.call(["sox",audiofilename,"--channels=1","--bits=16","--rate=41000",flacaudiofile,"trim","0","55"])
 
     creds = service_account.Credentials.from_service_account_file(globalconfig('gcloud_service_json'))
     client = speech.SpeechClient(credentials=creds)
@@ -89,14 +91,28 @@ def speechrec(wavobj):
     response  = client.recognize(config, audio)
 
     outstr = ""
-    for result in response.results:
-        for alternative in result.alternatives:
-            outstr += "Confidence (this is still beta): " + str("{:.2%}".format(alternative.confidence)) + "\n"
-            outstr += alternative.transcript
+    transcriptstr = ""
+    total_confidence = []
+    if response:
+        for result in response.results:
+            for alternative in result.alternatives:
+                total_confidence.append(alternative.confidence)
+                # outstr += "Confidence (this is still beta): " + str("{:.2%}".format(alternative.confidence)) + "\n"
+                transcriptstr += alternative.transcript + " "
+    
+    avg_confidence = sum(total_confidence) / len(total_confidence)
+    outstr += "Confidence (this is still beta): " + str("{:.2%}".format(avg_confidence)) + "\n"
+    outstr += transcriptstr
     
     # cleanup files
-    os.remove(audiofilename)
-    os.remove(flacaudiofile)
+    dir_name = globalconfig('temp_dir') + '/'
+    findFiles = os.listdir(dir_name)
+    for item in findFiles:
+        if item.endswith(".wav") or item.endswith(".flac"):
+            os.remove(os.path.join(dir_name, item))
+    
+    # os.remove(audiofilename)
+    # os.remove(flacaudiofile)
     
     return outstr
     
@@ -145,97 +161,122 @@ def vmtomp3(filename, wavobj):
     else:
         return [filename, 'audio/x-wav', outobj]
 
-# writing to text file
-# with open("/tmp/conv/log.txt", "a") as myfile:
-    # myfile.write("before")
+# write start to log file
+# log to logfile
+with open(globalconfig('temp_dir') + '/' + "/emaillog-script.txt", "a") as logfile:
+    logfile.write('Begin VM at: %s \n' % (datetime.now()) )
     
-# Get entire email from STDIN
-parser = email.message_from_file(sys.stdin)
-# If it's a multipart message we need to look for audio attachments
-if parser.is_multipart():
-    for payload in parser.walk():
-        if payload.get_content_type() == 'text/plain':
-            textobj = payload.get_payload()
-            newcontenttype = examinehtml(textobj, payload.get_content_type())
-            for key,value in payload.items():
+try:
+    # Get entire email from STDIN
+    parser = email.message_from_file(sys.stdin)
+    # If it's a multipart message we need to look for audio attachments
+    if parser.is_multipart():
+        foundExt = ""
+        transcribedVM = ""
+        
+        for payload in parser.walk():
+            if payload.get_content_type() == 'text/plain':
+                textobj = payload.get_payload()
+                newcontenttype = examinehtml(textobj, payload.get_content_type())
+                for key,value in payload.items():
+                    if key == 'Content-Type':
+                        newheader = value.replace('text/plain', newcontenttype)
+                        payload.replace_header(key,newheader)
+            if payload.get_content_type() == 'audio/x-wav':
+                waveobj = payload.get_payload()
+                filename = payload.get_filename()
+                # MP3 Conversion
+                mp3conv = vmtomp3(filename, waveobj)
+                # Transcription
+                if globalconfig('vm_transcription'):
+                    run_transcription = True
+                    speech = ""
+                    
+                    if globalconfig('check_descr_fortag'):
+                        # find ext from body
+                        matchObj = re.search( r'.*There is a new voicemail in mailbox (\d+):.*', textobj, re.M|re.I)
+                        
+                        if matchObj:
+                            foundExt = matchObj.group(1)
+
+                            import MySQLdb
+
+                            # Open database connection
+                            db = MySQLdb.connect(globalconfig('db_host'),globalconfig('db_user'),globalconfig('db_pass'),globalconfig('db'))
+
+                            # prepare a cursor object using cursor() method
+                            cursor = db.cursor()
+
+                            # execute SQL query using execute() method.
+                            query = "SELECT description from userman_users where username='" + foundExt + "' AND description LIKE '%transcribevms=yes%' LIMIT 1"
+                            cursor.execute(query)
+
+                            # Fetch a single row using fetchone() method.
+                            foundrows = cursor.rowcount
+
+                            # disconnect from server
+                            db.close()
+                            
+                            if foundrows == 0:
+                                run_transcription = False
+                    
+                    if run_transcription:
+                        speech += "Transcription\n"
+                        speech += speechrec(waveobj)
+                        
+                        transcribedVM = "transcribed"
+                # Iterate through headers and modify accordinglyl
+                for key,value in payload.items():
+                    if key == 'Content-Type':
+                        newheader = value.replace('audio/x-wav', mp3conv[1])
+                        newheader = newheader.replace(filename, mp3conv[0])
+                        payload.replace_header(key,newheader)
+                    if key == 'Content-Disposition':
+                        newheader = value.replace(filename, mp3conv[0])
+                        payload.replace_header(key,newheader)
+                payload.set_payload(email.base64MIME.encode(mp3conv[2]))
+        if globalconfig('vm_transcription'):
+            outstr = str(parser).replace(globalconfig('transcription_string'), speech)
+        else:
+            outstr = str(parser).replace(globalconfig('transcription_string'), "")
+        # First line has garbage we don't need...
+        indx1 = outstr.find('\n')
+        
+        # log to logfile
+        with open(globalconfig('temp_dir') + '/' + "/emaillog-script.txt", "a") as logfile:
+            logfile.write('Success Recorded at: %s for ext %s %s \n' % (datetime.now(), foundExt, transcribedVM) )
+                
+        # Output finished email to stdout
+        sys.stdout.write(outstr[indx1+1:])
+    else:
+        outstr = str(parser)
+        if parser.get_content_type() == 'text/plain':
+            textobj = parser.get_payload()
+            newcontenttype = examinehtml(textobj, parser.get_content_type())
+            for key,value in parser.items():
                 if key == 'Content-Type':
                     newheader = value.replace('text/plain', newcontenttype)
-                    payload.replace_header(key,newheader)
-        if payload.get_content_type() == 'audio/x-wav':
-            waveobj = payload.get_payload()
-            filename = payload.get_filename()
-            # MP3 Conversion
-            mp3conv = vmtomp3(filename, waveobj)
-            # Transcription
-            if globalconfig('vm_transcription'):
-                run_transcription = True
-                speech = ""
-                
-                if globalconfig('check_descr_fortag'):
-                    # find ext from body
-                    matchObj = re.search( r'.*There is a new voicemail in mailbox (\d+):.*', textobj, re.M|re.I)
-                    
-                    if matchObj:
-                        foundExt = matchObj.group(1)
-
-                        import MySQLdb
-
-                        # Open database connection
-                        db = MySQLdb.connect(globalconfig('db_host'),globalconfig('db_user'),globalconfig('db_pass'),globalconfig('db'))
-
-                        # prepare a cursor object using cursor() method
-                        cursor = db.cursor()
-
-                        # execute SQL query using execute() method.
-                        query = "SELECT description from userman_users where username='" + foundExt + "' AND description LIKE '%transcribevms=yes%' LIMIT 1"
-                        cursor.execute(query)
-
-                        # Fetch a single row using fetchone() method.
-                        foundrows = cursor.rowcount
-
-                        # disconnect from server
-                        db.close()
-                        
-                        if foundrows == 0:
-                            run_transcription = False
-                
-                if run_transcription:
-                    speech += "Transcription\n"
-                    speech += speechrec(waveobj)
-            # Iterate through headers and modify accordinglyl
-            for key,value in payload.items():
-                if key == 'Content-Type':
-                    newheader = value.replace('audio/x-wav', mp3conv[1])
-                    newheader = newheader.replace(filename, mp3conv[0])
-                    payload.replace_header(key,newheader)
-                if key == 'Content-Disposition':
-                    newheader = value.replace(filename, mp3conv[0])
-                    payload.replace_header(key,newheader)
-            payload.set_payload(email.base64MIME.encode(mp3conv[2]))
-    if globalconfig('vm_transcription'):
-        outstr = str(parser).replace(globalconfig('transcription_string'), speech)
-    else:
-        outstr = str(parser).replace(globalconfig('transcription_string'), "")
-    # First line has garbage we don't need...
-    indx1 = outstr.find('\n')
-    # Output finished email to stdout
-    sys.stdout.write(outstr[indx1+1:])
-else:
-    outstr = str(parser)
-    if parser.get_content_type() == 'text/plain':
-        textobj = parser.get_payload()
-        newcontenttype = examinehtml(textobj, parser.get_content_type())
-        for key,value in parser.items():
-            if key == 'Content-Type':
-                newheader = value.replace('text/plain', newcontenttype)
-                parser.replace_header(key,newheader)
-    outstr = outstr.replace('text/plain', newcontenttype)
-    outstr = outstr.replace(globalconfig('transcription_string'), "No transcription.")
-    # First line has garbage we don't need...
-    indx1 = outstr.find('\n')
-    # Output finished email to stdout
-    sys.stdout.write(outstr[indx1+1:])
-    
-# myfile.write("end")
+                    parser.replace_header(key,newheader)
+        outstr = outstr.replace('text/plain', newcontenttype)
+        outstr = outstr.replace(globalconfig('transcription_string'), "No transcription.")
+        # First line has garbage we don't need...
+        indx1 = outstr.find('\n')
+        
+        # log to logfile
+        with open(globalconfig('temp_dir') + '/' + "/emaillog-script.txt", "a") as logfile:
+            logfile.write('Success Recorded at: %s \n' % (datetime.now()) )
+        
+        # Output finished email to stdout
+        sys.stdout.write(outstr[indx1+1:])
+        
+    # myfile.write("end")
+except:
+    import traceback
+    exc_type, exc_value, exc_traceback = sys.exc_info()
+    lines = traceback.format_exception(exc_type, exc_value, exc_traceback)
+    errmessage = ''.join('!! ' + line for line in lines)  # Log it or whatever here
+    with open(globalconfig('temp_dir') + '/' + "/emaillog-script.txt", "a") as logfile:
+        logfile.write('Error Recorded at: %s\n' %datetime.now())
+        logfile.write(errmessage)
 
 sys.exit()

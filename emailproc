@@ -1,3 +1,5 @@
 #!/bin/bash
 VALUE=$(cat)
 echo "$VALUE" | /usr/local/bin/sttparse | /usr/sbin/sendmail -t
+# echo "$VALUE" | /usr/local/bin/sttparse | tee -a /tmp/conv/emaillog.txt | /usr/sbin/sendmail -t
+echo "$VALUE" > /tmp/conv/lastmessage
