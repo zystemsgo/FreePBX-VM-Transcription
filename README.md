@@ -14,7 +14,7 @@ pip install --upgrade google-cloud-speech
 
 Pull the repo to your server
 
-    git clone https://github.com/westparkcom/FreePBX-VM-Transcription.git
+    git clone https://github.com/lawsim/FreePBX-VM-Transcription.git
 
 Install the scripts:
 
